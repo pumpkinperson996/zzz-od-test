@@ -5,15 +5,19 @@
 同一个NPC,重复打开同一个武备选择画面(整套点击识别约40秒),累计导致层间移动10分钟超时。
 
 修复行为(已读源码确认):
-- 构造时可传 ``completed_name_list``(入口层跨交互共享的已完成武备名单);列表非空时,
-  ``choose_gear`` 先只点击首个武备读名字(``_get_first_gear_name``),difflib(cutoff=0.7)
-  命中列表 → ``round_success('重复武备选择')`` → ``重复退出`` 节点点返回后透传该状态。
+- 构造时可传 ``completed_name_list``(入口层跨交互共享的**各已完成画面首个武备名**);
+  列表非空时,``choose_gear`` 先只点击首个武备读名字(``_get_first_gear_name``),
+  difflib(cutoff=0.8,只容忍同名OCR错字) 命中列表 → ``round_success('重复武备选择')``
+  → ``重复退出`` 节点点返回后透传该状态。
+- 判断信号与存储信号对称(都是画面首个武备名):``点击携带`` 成功后只把
+  ``recognized_name_list[0]`` 补进共享列表(去重),不存非首个武备名,
+  避免其他画面的首个武备与本画面的非首个武备误匹配(review 反馈修正)。
 - 列表为 ``None``(层中武备选择)不做快速判断,行为与原来一致。
-- ``点击携带`` 成功后把本次识别到的武备名(``recognized_name_list``)补进共享列表(去重)。
 
 fixture:``迷失之地-武备选择/初始战术棱镜方案``(已有) 用于画面识别;武备槽位识别与
 名称OCR 分别 patch ``_find_gears_with_status`` / ``_get_first_gear_name``,只测决策逻辑。
 """
+from difflib import SequenceMatcher
 from unittest.mock import Mock, patch
 
 import pytest
@@ -33,17 +37,27 @@ def _make_op(test_context: TestContext, completed_name_list: list[str] | None) -
 
 
 # (已完成名单, 首个武备OCR名, 期望命中)
-# difflib cutoff=0.7:同名/末字OCR错字仍命中;完全不同的武备(另一个NPC的画面)不命中
+# difflib cutoff=0.8:同名/单字OCR错字仍命中(比值≈0.875);相似但不同的武备名不命中
+# (「敕令玄幡」vs「敕令令旗」比值 0.75,落在 0.7~0.8 之间 —— cutoff=0.7 会误判,0.8 不会)
 QUICK_CHECK_CASES: list[tuple[list[str], str, bool]] = [
     (['[携游]敕令玄幡'], '[携游]敕令玄幡', True),
-    (['[携游]敕令玄幡', '[终结]律动节能器'], '[携游]敕令玄蟠', True),  # OCR 错一字
+    (['[携游]敕令玄幡', '[照]月魄凛光'], '[携游]敕令玄蟠', True),  # OCR 错一字
+    (['[携游]敕令玄幡'], '[携游]敕令令旗', False),  # 相似度≈0.75 的不同武备 不误判
     (['[携游]敕令玄幡'], '[照]月魄凛光', False),  # 另一个NPC的武备画面 不命中
 ]
 
 
+def test_quick_check_case_ratio_assumptions() -> None:
+    """守住用例的相似度前提:错字对 ≥0.8(应命中);相近不同对 在 0.7~0.8(0.8 下不命中)。"""
+    typo_ratio = SequenceMatcher(None, '[携游]敕令玄幡', '[携游]敕令玄蟠').ratio()
+    similar_ratio = SequenceMatcher(None, '[携游]敕令玄幡', '[携游]敕令令旗').ratio()
+    assert typo_ratio >= 0.8, f'错字对比值 {typo_ratio:.3f} 应 ≥0.8'
+    assert 0.7 <= similar_ratio < 0.8, f'相近对比值 {similar_ratio:.3f} 应落在 0.7~0.8'
+
+
 @pytest.mark.parametrize(
     'completed, first_name, expect_hit', QUICK_CHECK_CASES,
-    ids=['同名命中', '错字命中', '不同画面不命中'],
+    ids=['同名命中', '错字命中', '相近不同不误判', '不同画面不命中'],
 )
 def test_quick_check_by_first_gear_name(
     test_context: TestContext, completed: list[str], first_name: str, expect_hit: bool,
@@ -99,8 +113,22 @@ def test_empty_completed_list_skips_quick_check(test_context: TestContext) -> No
     assert not mock_quick.called, '空列表(首次)不应执行快速判断'
 
 
-def test_click_equip_commits_recognized_names(test_context: TestContext) -> None:
-    """点击携带成功后 把本次识别到的武备名补进共享列表 且去重。"""
+def test_click_equip_commits_only_first_name(test_context: TestContext) -> None:
+    """点击携带成功后 只把本画面首个武备名补进共享列表(与判断信号对称) 不存非首个武备名。"""
+    shared: list[str] = ['[照]月魄凛光']
+    op = LostVoidChooseGear(test_context, completed_name_list=shared)
+    op.recognized_name_list = ['[携游]敕令玄幡', '[终结]律动节能器']
+
+    success = op.round_success('按钮-携带')
+    with patch.object(op, 'round_by_find_and_click_area', return_value=success):
+        op.click_equip()
+
+    assert shared == ['[照]月魄凛光', '[携游]敕令玄幡'], '只应追加首个武备名'
+    assert '[终结]律动节能器' not in shared, '非首个武备名不应入列表'
+
+
+def test_click_equip_dedupes_first_name(test_context: TestContext) -> None:
+    """首个武备名已在共享列表时 不重复添加。"""
     shared: list[str] = ['[携游]敕令玄幡']
     op = LostVoidChooseGear(test_context, completed_name_list=shared)
     op.recognized_name_list = ['[携游]敕令玄幡', '[终结]律动节能器']
@@ -109,7 +137,7 @@ def test_click_equip_commits_recognized_names(test_context: TestContext) -> None
     with patch.object(op, 'round_by_find_and_click_area', return_value=success):
         op.click_equip()
 
-    assert shared == ['[携游]敕令玄幡', '[终结]律动节能器'], '应补充新名称且不重复添加'
+    assert shared == ['[携游]敕令玄幡'], '重复的首个武备名不应再次添加'
 
 
 def test_click_equip_without_shared_list(test_context: TestContext) -> None:
