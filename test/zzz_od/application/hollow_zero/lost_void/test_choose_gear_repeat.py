@@ -9,9 +9,10 @@
   列表非空时,``choose_gear`` 先只点击首个武备读名字(``_get_first_gear_name``),
   difflib(cutoff=0.8,只容忍同名OCR错字) 命中列表 → ``round_success('重复武备选择')``
   → ``重复退出`` 节点点返回后透传该状态。
-- 判断信号与存储信号对称(都是画面首个武备名):``点击携带`` 成功后只把
-  ``recognized_name_list[0]`` 补进共享列表(去重),不存非首个武备名,
-  避免其他画面的首个武备与本画面的非首个武备误匹配(review 反馈修正)。
+- 判断信号与存储信号对称(都是画面**最左侧槽位**的武备名):``get_gear_pos_by_click_ocr``
+  从槽位0的OCR文本解析 ``first_slot_gear_name``(解析失败为 None);``点击携带`` 成功后
+  只把它补进共享列表(去重),不存非首个武备名 也不存"第一个解析成功"的错位名字,
+  避免其他画面的首个武备与本画面的非首个武备误匹配(review 反馈两轮修正)。
 - 列表为 ``None``(层中武备选择)不做快速判断,行为与原来一致。
 
 fixture:``迷失之地-武备选择/初始战术棱镜方案``(已有) 用于画面识别;武备槽位识别与
@@ -113,37 +114,66 @@ def test_empty_completed_list_skips_quick_check(test_context: TestContext) -> No
     assert not mock_quick.called, '空列表(首次)不应执行快速判断'
 
 
-def test_click_equip_commits_only_first_name(test_context: TestContext) -> None:
-    """点击携带成功后 只把本画面首个武备名补进共享列表(与判断信号对称) 不存非首个武备名。"""
+def test_first_slot_name_not_replaced_by_next_parsed_slot(test_context: TestContext) -> None:
+    """最左格OCR解析失败时 first_slot_gear_name 为 None 而不是顺延取下一个解析成功的槽位。"""
+    test_context.lost_void.load_artifact_data()
+    op = LostVoidChooseGear(test_context, completed_name_list=[])
+
+    # 槽位0解析失败(无[分类]名称结构) 槽位1解析成功 → 不应把槽位1当作最左格
+    op._update_first_slot_gear_name(['???', '[携游]敕令玄幡'])
+    assert op.first_slot_gear_name is None, '最左格解析失败时不应顺延取后面槽位'
+
+    op._update_first_slot_gear_name(['[携游]敕令玄幡', '[终结]律动节能器'])
+    assert op.first_slot_gear_name == '[携游]敕令玄幡'
+
+    op._update_first_slot_gear_name([])
+    assert op.first_slot_gear_name is None
+
+
+def test_click_equip_commits_first_slot_name(test_context: TestContext) -> None:
+    """点击携带成功后 只把最左侧槽位武备名补进共享列表(与判断信号对称)。"""
     shared: list[str] = ['[照]月魄凛光']
     op = LostVoidChooseGear(test_context, completed_name_list=shared)
-    op.recognized_name_list = ['[携游]敕令玄幡', '[终结]律动节能器']
+    op.first_slot_gear_name = '[携游]敕令玄幡'
 
     success = op.round_success('按钮-携带')
     with patch.object(op, 'round_by_find_and_click_area', return_value=success):
         op.click_equip()
 
-    assert shared == ['[照]月魄凛光', '[携游]敕令玄幡'], '只应追加首个武备名'
-    assert '[终结]律动节能器' not in shared, '非首个武备名不应入列表'
+    assert shared == ['[照]月魄凛光', '[携游]敕令玄幡'], '只应追加最左侧槽位武备名'
 
 
-def test_click_equip_dedupes_first_name(test_context: TestContext) -> None:
-    """首个武备名已在共享列表时 不重复添加。"""
+def test_click_equip_dedupes_first_slot_name(test_context: TestContext) -> None:
+    """最左侧槽位武备名已在共享列表时 不重复添加。"""
     shared: list[str] = ['[携游]敕令玄幡']
     op = LostVoidChooseGear(test_context, completed_name_list=shared)
-    op.recognized_name_list = ['[携游]敕令玄幡', '[终结]律动节能器']
+    op.first_slot_gear_name = '[携游]敕令玄幡'
 
     success = op.round_success('按钮-携带')
     with patch.object(op, 'round_by_find_and_click_area', return_value=success):
         op.click_equip()
 
-    assert shared == ['[携游]敕令玄幡'], '重复的首个武备名不应再次添加'
+    assert shared == ['[携游]敕令玄幡'], '重复的武备名不应再次添加'
+
+
+def test_click_equip_skips_when_first_slot_unparsed(test_context: TestContext) -> None:
+    """最左侧槽位OCR解析失败(first_slot_gear_name=None)时 本画面不记录 不写入错位名字。"""
+    shared: list[str] = ['[照]月魄凛光']
+    op = LostVoidChooseGear(test_context, completed_name_list=shared)
+    op.first_slot_gear_name = None
+
+    success = op.round_success('按钮-携带')
+    with patch.object(op, 'round_by_find_and_click_area', return_value=success):
+        result = op.click_equip()
+
+    assert result.is_success
+    assert shared == ['[照]月魄凛光'], '最左格解析失败时不应写入任何名字'
 
 
 def test_click_equip_without_shared_list(test_context: TestContext) -> None:
     """completed_name_list 为 None 时 点击携带不报错(层中武备选择场景)。"""
     op = LostVoidChooseGear(test_context, completed_name_list=None)
-    op.recognized_name_list = ['[携游]敕令玄幡']
+    op.first_slot_gear_name = '[携游]敕令玄幡'
 
     success = op.round_success('按钮-携带')
     with patch.object(op, 'round_by_find_and_click_area', return_value=success):
