@@ -124,3 +124,47 @@ def test_plan_with_empty_slot(test_context: TestContext) -> None:
     assert result.status == '需调整'
     assert len(op.plan) == 3
     assert [slot for slot, _ in op.plan] == [0, 1, 2]
+
+
+# ===== 拿不到UP时提前收手 =====
+
+
+def _make_plain_op(test_context: TestContext, lineup_names: list[str],
+                   up_names: list[str]) -> LostVoidComposeUpTeam:
+    """不依赖画面 只测 _can_still_get_up 的判断。"""
+    return LostVoidComposeUpTeam(
+        test_context, _agents(*lineup_names), {a.agent_id for a in _agents(*up_names)})
+
+
+def test_can_still_get_up_when_up_left_in_plan(test_context: TestContext) -> None:
+    """计划里还有没试过的UP → 继续换下去。"""
+    op = _make_plain_op(test_context, ['蕾米埃尔', '爱丽丝', '薇薇安'], ['蕾米埃尔', '爱丽丝'])
+    op.plan = list(zip([0, 1, 2], op.lineup, strict=False))
+    op.plan_idx = 1  # 槽位0的蕾米埃尔没找到 但爱丽丝还没试
+    assert op._can_still_get_up() is True
+
+
+def test_can_not_get_up_after_all_up_missed(test_context: TestContext) -> None:
+    """UP都试过且都没找到 原编队也没有UP → 不再动剩余槽位。"""
+    op = _make_plain_op(test_context, ['蕾米埃尔', '爱丽丝', '薇薇安'], ['蕾米埃尔', '爱丽丝'])
+    op.plan = list(zip([0, 1, 2], op.lineup, strict=False))
+    op.plan_idx = 2  # 只剩搭档薇薇安
+    assert op._can_still_get_up() is False
+
+
+def test_can_still_get_up_when_original_team_has_up(test_context: TestContext) -> None:
+    """原编队自带UP(没被换掉) → 即使目标UP没找到也还算数。"""
+    op = _make_plain_op(test_context, ['蕾米埃尔', '爱丽丝', '薇薇安'], ['蕾米埃尔', '爱丽丝'])
+    op.plan = list(zip([0, 1, 2], op.lineup, strict=False))
+    op.plan_idx = 2
+    op.kept_up = True
+    assert op._can_still_get_up() is True
+
+
+def test_can_still_get_up_after_placed(test_context: TestContext) -> None:
+    """已经换入过UP → 后面搭档找不到也不影响。"""
+    op = _make_plain_op(test_context, ['蕾米埃尔', '爱丽丝', '薇薇安'], ['蕾米埃尔', '爱丽丝'])
+    op.plan = list(zip([0, 1, 2], op.lineup, strict=False))
+    op.plan_idx = 2
+    op.placed = _agents('蕾米埃尔')
+    assert op._can_still_get_up() is True
