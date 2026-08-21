@@ -16,6 +16,11 @@
    本层交互状态(had_been_list/interacted_target_key_list/entry_gear_* /ao_fei_li_ya_talked);
    ``non_battle_check`` 的10分钟超时以 ``attempt_start_time``(为0时退回
    ``operation_start_time``)为起点。
+4. ``try_interact``:入口层放弃感叹号(``感叹号`` 已在 ``had_been_list``)后,按交互键前
+   先读画面交互文本;文本是入口或没交互过的目标才按键,文本是已交互过的NPC或读不出时
+   不按,蛇形走位(前进+左右交替横移)后重试(最多8次,重复退出后计数清零)。同阶段
+   ``_approach_remaining_interact_target`` 不再后退,保持前进且步长随重复次数加大;
+   ``non_battle_check`` 中走向感叹号的移动超时在完成过武备选择后转为放弃感叹号。
 
 fixture:``迷失之地-武备选择/初始战术棱镜方案``、``迷失之地-大世界/玛琳前-以太稳定``(均已有)。
 """
@@ -50,10 +55,12 @@ def test_handle_interact_repeat_twice_ignores_exclamation(test_context: TestCont
     test_context.mock_screen('迷失之地-武备选择', '初始战术棱镜方案')
     op.screenshot()
 
+    op.entry_door_block_times = 5  # 应在每次重复退出后清零
     repeated = OperationResult(success=True, status=LostVoidChooseGear.STATUS_REPEATED)
     with patch.object(LostVoidChooseGear, 'execute', return_value=repeated):
         op.handle_interact()
         assert op.entry_gear_repeat_times == 1
+        assert op.entry_door_block_times == 0, '重复退出后应重置前进重试计数'
         assert '感叹号' not in op.had_been_list, '第1次重复不应放弃感叹号'
         assert op.entry_gear_interact_done, '完成武备选择交互后应置站位调整标志'
 
@@ -183,6 +190,7 @@ def test_restart_resets_attempt_timer_and_level_state(test_context: TestContext)
     op.entry_gear_name_list.extend(['[携游]敕令玄幡'])
     op.entry_gear_repeat_times = 2
     op.entry_gear_interact_done = True
+    op.entry_door_block_times = 3
     op.ao_fei_li_ya_talked = True
 
     ok = OperationResult(success=True, status='按钮-退出战斗-确认')
@@ -198,7 +206,163 @@ def test_restart_resets_attempt_timer_and_level_state(test_context: TestContext)
     assert op.entry_gear_name_list == []
     assert op.entry_gear_repeat_times == 0
     assert not op.entry_gear_interact_done
+    assert op.entry_door_block_times == 0
     assert not op.ao_fei_li_ya_talked
+
+
+def _run_try_interact_with_ocr_text(
+        test_context: TestContext, op: LostVoidRunLevel, ocr_text: str):
+    """驱动 try_interact:交互按键可见 + 交互文本OCR返回指定文本;返回(轮次结果, interact mock, move_w mock)。"""
+    test_context.mock_screen('迷失之地-大世界', '玛琳前-以太稳定')
+    op.screenshot()
+    key_found = op.round_success(status='按键-交互')
+    with (
+        patch.object(op, 'round_by_find_area', return_value=key_found),
+        patch.object(test_context.ocr, 'crop_and_run_ocr', return_value={ocr_text: Mock()}),
+        patch.object(test_context.controller, 'interact') as mock_interact,
+        patch.object(test_context.controller, 'move_w') as mock_forward,
+    ):
+        result = op.try_interact()
+    return result, mock_interact, mock_forward
+
+
+def test_try_interact_blocked_by_interacted_npc_after_abandon(test_context: TestContext) -> None:
+    """放弃感叹号后 交互文本是已交互过的NPC(按下会重复打开武备画面)→ 不按键 走位后重试。"""
+    op = _make_op(test_context)
+    op.had_been_list = ['感叹号']
+    op.interacted_target_key_list = ['感叹号:蕾']
+
+    result, mock_interact, mock_forward = _run_try_interact_with_ocr_text(test_context, op, '蕾')
+
+    assert result.status == '走位接近下层入口'
+    assert not mock_interact.called, '交互文本是已交互NPC时不应按交互键'
+    assert mock_forward.called, '应走位接近下层入口'
+    assert op.entry_door_block_times == 1
+
+
+def test_try_interact_presses_fresh_npc_after_abandon(test_context: TestContext) -> None:
+    """放弃感叹号后 交互文本是没交互过的NPC → 按键(补上此前一直没命中的交互)。"""
+    op = _make_op(test_context)
+    op.had_been_list = ['感叹号']
+    op.interacted_target_key_list = ['感叹号:蕾']
+
+    result, mock_interact, _ = _run_try_interact_with_ocr_text(test_context, op, '奥菲莉亚')
+
+    assert result.status == '交互'
+    assert mock_interact.called, '未交互过的NPC应正常按键'
+    assert op.entry_door_block_times == 0
+
+
+def test_try_interact_presses_when_text_is_entry(test_context: TestContext) -> None:
+    """放弃感叹号后 交互文本是下层入口 → 正常按下交互。"""
+    op = _make_op(test_context)
+    op.had_been_list = ['感叹号']
+    door_text = LostVoidRegionType.COMBAT_GEAR.value.value
+
+    result, mock_interact, _ = _run_try_interact_with_ocr_text(test_context, op, door_text)
+
+    assert result.status == '交互'
+    assert mock_interact.called
+    assert op.interact_target is not None and op.interact_target.is_entry
+    assert op.entry_door_block_times == 0
+
+
+def test_try_interact_npc_block_has_retry_limit(test_context: TestContext) -> None:
+    """走位重试达到上限后 直接按交互(避免尝试交互节点内无限等待)。"""
+    op = _make_op(test_context)
+    op.had_been_list = ['感叹号']
+    op.interacted_target_key_list = ['感叹号:蕾']
+    op.entry_door_block_times = 8
+
+    result, mock_interact, _ = _run_try_interact_with_ocr_text(test_context, op, '蕾')
+
+    assert result.status == '交互'
+    assert mock_interact.called, '达到上限后应直接交互(由重复退出兜底)'
+    assert op.entry_door_block_times == 8
+
+
+def test_try_interact_npc_not_blocked_before_abandon(test_context: TestContext) -> None:
+    """未放弃感叹号时 入口层交互NPC不受门口防护影响(正常按键)。"""
+    op = _make_op(test_context)
+
+    result, mock_interact, _ = _run_try_interact_with_ocr_text(test_context, op, '蕾')
+
+    assert result.status == '交互'
+    assert mock_interact.called
+    assert op.entry_door_block_times == 0
+
+
+def test_try_interact_unparsed_text_blocked_after_abandon(test_context: TestContext) -> None:
+    """放弃感叹号后 交互文本读不出目标(门口常见杂讯)→ 同样不按键 走位后重试。"""
+    op = _make_op(test_context)
+    op.had_been_list = ['感叹号']
+
+    result, mock_interact, mock_forward = _run_try_interact_with_ocr_text(test_context, op, 'NEPS.')
+
+    assert result.status == '走位接近下层入口'
+    assert not mock_interact.called, '未确认可交互目标时不应盲按'
+    assert mock_forward.called
+    assert op.entry_door_block_times == 1
+
+
+def test_try_interact_unparsed_text_presses_before_abandon(test_context: TestContext) -> None:
+    """未放弃感叹号时 交互文本读不出目标 → 保持官方原行为直接按键。"""
+    op = _make_op(test_context)
+
+    result, mock_interact, _ = _run_try_interact_with_ocr_text(test_context, op, 'NEPS.')
+
+    assert result.status == '交互'
+    assert mock_interact.called
+    assert op.entry_door_block_times == 0
+
+
+def test_handle_find_target_fail_abandons_exclamation_first(test_context: TestContext) -> None:
+    """入口层完成过武备选择后的超时 → 先放弃感叹号找下层入口(不重开 不消耗重试次数);
+    已放弃过 / 没选到武备 / 非入口层 → 正常重开。"""
+    for region, gear_names, had_been, expect_abandon in [
+        (LostVoidRegionType.ENTRY, ['[携游]敕令玄幡'], [], True),
+        (LostVoidRegionType.ENTRY, ['[携游]敕令玄幡'], ['感叹号'], False),
+        (LostVoidRegionType.ENTRY, [], [], False),
+        (LostVoidRegionType.COMBAT_GEAR, ['[携游]敕令玄幡'], [], False),
+    ]:
+        op = _make_op(test_context, region)
+        op.entry_gear_name_list.extend(gear_names)
+        op.had_been_list = list(had_been)
+
+        ok = OperationResult(success=True, status='按钮-退出战斗-确认')
+        with patch.object(RestartInBattle, 'execute', return_value=ok) as mock_restart:
+            result = op.handle_find_target_fail()
+
+        case = f'{region}/{gear_names}/{had_been}'
+        assert result.is_success and result.status == '准备重试', case
+        if expect_abandon:
+            assert not mock_restart.called, f'{case}: 应放弃感叹号而不是重开'
+            assert '感叹号' in op.had_been_list, case
+            assert op.restart_count == 0, f'{case}: 不应消耗重开次数'
+            assert op.attempt_start_time > 0, f'{case}: 应重置计时起点'
+        else:
+            assert mock_restart.called, f'{case}: 应正常重开'
+            assert op.restart_count == 1, case
+
+
+def test_approach_after_abandon_keeps_moving_forward(test_context: TestContext) -> None:
+    """放弃感叹号后的站位调整:不后退 不查剩余感叹号 保持前进。"""
+    op = _make_op(test_context)
+    op.had_been_list = ['感叹号']
+    test_context.mock_screen('迷失之地-大世界', '玛琳前-以太稳定')
+    op.screenshot()
+
+    mock_detector = Mock()
+    with (
+        patch.object(test_context.lost_void, 'detector', mock_detector),
+        patch.object(test_context.controller, 'move_s') as mock_back,
+        patch.object(test_context.controller, 'move_w') as mock_forward,
+    ):
+        op._approach_remaining_interact_target()
+
+    assert mock_forward.called, '应保持前进'
+    assert not mock_back.called, '不应后退(会退回被抢交互的位置)'
+    assert not mock_detector.get_result_by_x.called, '放弃后不需要再找剩余感叹号'
 
 
 def test_non_battle_check_timeout_by_attempt_start_time(test_context: TestContext) -> None:
