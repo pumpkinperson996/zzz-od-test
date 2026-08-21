@@ -19,6 +19,7 @@
 """
 from unittest.mock import Mock, patch
 
+import pytest
 from test.conftest import TestContext
 
 from one_dragon.base.operation.operation import Operation
@@ -109,6 +110,19 @@ def test_constellation_count_change_or_empty() -> None:
     assert not is_same_box_constellation([], [(100.0, 200.0, 50.0)])
 
 
+def test_constellation_matching_order_independent() -> None:
+    """完全匹配不受遍历顺序影响(贪心会漏配的场景)。
+
+    旧中心 0/20 新中心 8/-10(max_dis=15):贪心时 8 先占 0 导致 -10 无法配对;
+    合法配对是 8->20、-10->0 应判为整体不动。
+    """
+    old = [(0.0, 300.0, 50.0), (20.0, 300.0, 50.0)]
+    new = [(8.0, 300.0, 50.0), (-10.0, 300.0, 50.0)]
+    assert is_same_box_constellation(old, new)
+    # 反向传参同样成立
+    assert is_same_box_constellation(new, old)
+
+
 # ---------- check_stuck 时间窗判定 ----------
 
 def test_check_stuck_static_with_jitter(test_context: TestContext, monkeypatch) -> None:
@@ -182,6 +196,26 @@ def test_check_stuck_requires_move_seconds(test_context: TestContext, monkeypatc
     # 只有两帧间隔 4 秒:帧间隔 >=1 秒不计入前进时长 累计仍为 0
     assert _feed_frame(op, 400, base) is None
     assert _feed_frame(op, 404, base) is None, '没有累计前进时长 不应判定卡住'
+
+
+def test_check_stuck_pause_not_counted_after_reset(test_context: TestContext, monkeypatch) -> None:
+    """短暂丢失目标停止前进后(节点会清 last_move_frame_time) 停顿时间不计入累计前进时长。"""
+    op = _make_op(test_context)
+    monkeypatch.setattr(test_context.controller, 'stop_moving_forward', Mock(), raising=False)
+
+    base = [(600.0, 300.0, 50.0)]
+    assert _feed_frame(op, 500.0, base) is None
+    assert _feed_frame(op, 500.25, base) is None
+    assert op.total_move_seconds == pytest.approx(0.25)
+
+    # 模拟短暂丢失目标:移动节点停止前进并清除前进帧时间
+    op.last_move_frame_time = 0
+    # 0.6 秒后目标重现:这段停顿不应计入
+    assert _feed_frame(op, 500.85, base) is None
+    assert op.total_move_seconds == pytest.approx(0.25), '停顿期不应计入累计前进时长'
+    # 重现后的连续前进帧正常累计
+    assert _feed_frame(op, 501.1, base) is None
+    assert op.total_move_seconds == pytest.approx(0.5)
 
 
 # ---------- get_out_of_stuck 脱困策略 ----------
