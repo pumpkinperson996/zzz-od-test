@@ -168,3 +168,36 @@ def test_can_still_get_up_after_placed(test_context: TestContext) -> None:
     op.plan_idx = 2
     op.placed = _agents('蕾米埃尔')
     assert op._can_still_get_up() is True
+
+
+# ===== 换人计划: 搭档不顶掉当前持有UP的槽位 =====
+
+
+def _make_planned_op(test_context: TestContext, current_names: list[str | None],
+                     lineup_names: list[str], up_names: list[str]) -> LostVoidComposeUpTeam:
+    """打桩槽位读取 只测 check_current_team 的计划生成。"""
+    op = LostVoidComposeUpTeam(
+        test_context, _agents(*lineup_names), {a.agent_id for a in _agents(*up_names)})
+    current_ids = [(_agents(n)[0].agent_id if n is not None else None) for n in current_names]
+    op._read_current_member_ids = lambda: current_ids
+    return op
+
+
+def test_plan_partner_never_replaces_up_slot(test_context: TestContext) -> None:
+    """队里已有不在目标配队里的UP(试用维琳娜) → 搭档只配到非UP槽位 维琳娜留下 多出的搭档放弃。
+    否则UP换入失败时 kept_up 依据的维琳娜会被换搭档顶掉 队里反而没UP。"""
+    op = _make_planned_op(test_context, ['妮可', '维琳娜', '比利'],
+                          ['蕾米埃尔', '薇薇安', '普罗米娅'], ['蕾米埃尔', '维琳娜', '爱丽丝'])
+    result = op.check_current_team()
+    assert result.status == '需调整'
+    assert op.kept_up is True
+    assert [(slot, agent.agent_name) for slot, agent in op.plan] == [(0, '蕾米埃尔'), (2, '薇薇安')]
+
+
+def test_plan_up_may_replace_up_slot(test_context: TestContext) -> None:
+    """非UP槽位不够时 多出来的目标UP才允许换掉队里的UP(艾莲保留 蕾米埃尔换妮可 爱丽丝换维琳娜)。"""
+    op = _make_planned_op(test_context, ['维琳娜', '妮可', '艾莲'],
+                          ['蕾米埃尔', '爱丽丝', '艾莲'], ['蕾米埃尔', '维琳娜', '爱丽丝'])
+    result = op.check_current_team()
+    assert result.status == '需调整'
+    assert [(slot, agent.agent_name) for slot, agent in op.plan] == [(1, '蕾米埃尔'), (0, '爱丽丝')]
