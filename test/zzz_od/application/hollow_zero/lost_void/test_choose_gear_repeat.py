@@ -13,6 +13,8 @@
   从槽位0的OCR文本解析 ``first_slot_gear_name``(解析失败为 None);``点击携带`` 成功后
   只把它补进共享列表(去重),不存非首个武备名 也不存"第一个解析成功"的错位名字,
   避免其他画面的首个武备与本画面的非首个武备误匹配(review 反馈两轮修正)。
+- 名单已有 2 个武备名(入口层只有两个武备NPC,都完成过)时,再进武备画面必为重复,
+  不点首格不读名直接退出(2026-08-26 提速)。
 - 列表为 ``None``(层中武备选择)不做快速判断,行为与原来一致。
 
 fixture:``迷失之地-武备选择/初始战术棱镜方案``(已有) 用于画面识别;武备槽位识别与
@@ -40,9 +42,10 @@ def _make_op(test_context: TestContext, completed_name_list: list[str] | None) -
 # (已完成名单, 首个武备OCR名, 期望命中)
 # difflib cutoff=0.8:同名/单字OCR错字仍命中(比值≈0.875);相似但不同的武备名不命中
 # (「敕令玄幡」vs「敕令令旗」比值 0.75,落在 0.7~0.8 之间 —— cutoff=0.7 会误判,0.8 不会)
+# 名单固定单元素:两个武备都完成后走"必为重复"捷径不再读名(见下方专项用例)
 QUICK_CHECK_CASES: list[tuple[list[str], str, bool]] = [
     (['[携游]敕令玄幡'], '[携游]敕令玄幡', True),
-    (['[携游]敕令玄幡', '[照]月魄凛光'], '[携游]敕令玄蟠', True),  # OCR 错一字
+    (['[携游]敕令玄幡'], '[携游]敕令玄蟠', True),  # OCR 错一字
     (['[携游]敕令玄幡'], '[携游]敕令令旗', False),  # 相似度≈0.75 的不同武备 不误判
     (['[携游]敕令玄幡'], '[照]月魄凛光', False),  # 另一个NPC的武备画面 不命中
 ]
@@ -82,6 +85,23 @@ def test_quick_check_by_first_gear_name(
         # 不命中 → 走原有流程(此处 get_gear_pos_by_click_ocr 返回空 → round_retry)
         assert mock_full_ocr.called, '不命中时应继续原有识别流程'
         assert not result.is_success
+
+
+def test_two_completed_gears_short_circuits_without_reading(test_context: TestContext) -> None:
+    """名单已有2个武备名(入口层两个武备NPC都完成)→ 必为重复 不点首格不读名直接退出。"""
+    op = _make_op(test_context, ['[携游]敕令玄幡', '[照]月魄凛光'])
+
+    with (
+        patch.object(test_context.controller, 'mouse_move', create=True),
+        patch.object(op, '_find_gears_with_status') as mock_find,
+        patch.object(op, '_get_first_gear_name') as mock_quick,
+    ):
+        result = op.choose_gear()
+
+    assert result.is_success
+    assert result.status == LostVoidChooseGear.STATUS_REPEATED
+    assert not mock_find.called, '两武备均完成时连槽位识别都不需要'
+    assert not mock_quick.called, '两武备均完成时不需要点首格读名'
 
 
 def test_none_completed_list_skips_quick_check(test_context: TestContext) -> None:
